@@ -19,6 +19,12 @@ const io = new Server(httpServer, {
   }
 });
 
+interface QueueItem {
+  songId: string;
+  title: string;
+  addedBy: string;
+}
+
 interface RoomState {
   roomId: string;
   hostId: string | null;
@@ -26,6 +32,7 @@ interface RoomState {
   currentTime: number;
   songId: string;
   lastUpdated: number; // Date.now() when last updated
+  queue: QueueItem[];
 }
 
 // Global in-memory store for room state
@@ -54,7 +61,8 @@ io.on('connection', (socket: Socket) => {
         isPlaying: false,
         currentTime: 0,
         songId: '',
-        lastUpdated: Date.now()
+        lastUpdated: Date.now(),
+        queue: []
       };
       rooms.set(roomId, room);
       console.log(`[Server] Room created: ${roomId}. Host assigned: ${socket.id} (${username})`);
@@ -74,7 +82,8 @@ io.on('connection', (socket: Socket) => {
       isPlaying: room.isPlaying,
       currentTime: currentCalculatedTime,
       songId: room.songId,
-      isHost: room.hostId === socket.id
+      isHost: room.hostId === socket.id,
+      queue: room.queue
     });
 
     // Notify others in the room
@@ -102,11 +111,9 @@ io.on('connection', (socket: Socket) => {
     const room = rooms.get(roomId);
     if (!room) return;
 
-    // Check if the command is coming from the Host.
-    // In a strict MVP, we sync to the host. If host is null, anyone can control.
     const isHost = room.hostId === socket.id || room.hostId === null;
     if (!isHost) {
-      // Reject command and send back the correct host state to this client
+      // Reject command and send back correct state
       console.log(`[Server] Unauthorized playback command rejected from non-host client: ${username}`);
       socket.emit('force-sync', {
         isPlaying: room.isPlaying,
@@ -128,7 +135,6 @@ io.on('connection', (socket: Socket) => {
     console.log(`[Server] Playback command from Host (${username}) in room ${roomId}: ${data.command} at ${data.currentTime}s (Song ID: ${data.songId})`);
 
     // Broadcast command to other clients in the room
-    // Add serverTimestamp so receivers can perform latency offset compensation
     socket.to(roomId).emit('remote-playback-command', {
       command: data.command,
       currentTime: data.currentTime,
@@ -137,7 +143,7 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
-  // Allow clients to request a manual sync from the host (or server state)
+  // Allow clients to request a manual sync from the host
   socket.on('request-sync', () => {
     const meta = socketMetadata.get(socket.id);
     if (!meta) return;
@@ -157,12 +163,13 @@ io.on('connection', (socket: Socket) => {
       isPlaying: room.isPlaying,
       currentTime: currentCalculatedTime,
       songId: room.songId,
-      isHost: room.hostId === socket.id
+      isHost: room.hostId === socket.id,
+      queue: room.queue
     });
   });
 
   // Handle claiming host role
-  socket.on('claim-host', () => {
+  socket.on('claim-host', (data?: { songId: string; currentTime: number; isPlaying: boolean }) => {
     const meta = socketMetadata.get(socket.id);
     if (!meta) return;
     const { roomId, username } = meta;
@@ -170,18 +177,111 @@ io.on('connection', (socket: Socket) => {
     if (!room) return;
 
     room.hostId = socket.id;
+    
+    // Update room state with new host state
+    if (data && data.songId) {
+      room.songId = data.songId;
+      room.currentTime = data.currentTime;
+      room.isPlaying = data.isPlaying;
+      console.log(`[Server] User ${username} claimed host role. Syncing room to: Song ID ${room.songId} at ${room.currentTime}s (playing: ${room.isPlaying})`);
+    } else {
+      console.log(`[Server] User ${username} claimed host role.`);
+    }
+
     room.lastUpdated = Date.now();
-    console.log(`[Server] User ${username} claimed host role in room: ${roomId}`);
 
     io.in(roomId).emit('host-changed', {
       hostId: socket.id,
       hostUsername: username
     });
 
+    // Broadcast state to other clients immediately
+    if (data && data.songId) {
+      socket.to(roomId).emit('remote-playback-command', {
+        command: room.isPlaying ? 'play' : 'pause',
+        currentTime: room.currentTime,
+        songId: room.songId,
+        serverTimestamp: Date.now()
+      });
+    }
+
     sendRoomMembers(roomId);
   });
 
-  // Handle ping for latency estimation
+  // -------------------------------------------------------------
+  // Queue Sync Events
+  // -------------------------------------------------------------
+
+  // Add a song to the queue
+  socket.on('add-to-queue', (data: { songId: string; title: string }) => {
+    const meta = socketMetadata.get(socket.id);
+    if (!meta) return;
+    const { roomId, username } = meta;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const newItem: QueueItem = {
+      songId: data.songId,
+      title: data.title || 'Canción Desconocida',
+      addedBy: username
+    };
+
+    room.queue.push(newItem);
+    console.log(`[Server] Song added to queue in room ${roomId}: "${newItem.title}" by ${username}`);
+
+    // Broadcast updated queue to the room
+    io.in(roomId).emit('queue-updated', room.queue);
+  });
+
+  // Remove a song from the queue (by index)
+  socket.on('remove-from-queue', (data: { index: number }) => {
+    const meta = socketMetadata.get(socket.id);
+    if (!meta) return;
+    const { roomId, username } = meta;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (data.index >= 0 && data.index < room.queue.length) {
+      const removed = room.queue.splice(data.index, 1);
+      console.log(`[Server] Song removed from queue in room ${roomId}: "${removed[0].title}" by ${username}`);
+      io.in(roomId).emit('queue-updated', room.queue);
+    }
+  });
+
+  // Autoplay next song from queue (invoked by the Host)
+  socket.on('play-next-from-queue', () => {
+    const meta = socketMetadata.get(socket.id);
+    if (!meta) return;
+    const { roomId, username } = meta;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    // Verify sender is host
+    if (room.hostId !== socket.id) return;
+
+    if (room.queue.length > 0) {
+      const nextSong = room.queue.shift(); // Remove first element
+      if (nextSong) {
+        room.songId = nextSong.songId;
+        room.currentTime = 0;
+        room.isPlaying = true;
+        room.lastUpdated = Date.now();
+
+        console.log(`[Server] Autoplaying next song from queue in room ${roomId}: "${nextSong.title}"`);
+
+        // Broadcast queue update and song change
+        io.in(roomId).emit('queue-updated', room.queue);
+        io.in(roomId).emit('remote-playback-command', {
+          command: 'song-change',
+          currentTime: 0,
+          songId: room.songId,
+          serverTimestamp: Date.now()
+        });
+      }
+    }
+  });
+
+  // Handle ping
   socket.on('ping-sync', (clientTime: number) => {
     socket.emit('pong-sync', {
       clientTime,
@@ -189,53 +289,58 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
+  // Handle explicit leaving
+  socket.on('leave-room', () => {
+    handleUserLeaving(socket);
+  });
+
   // Disconnection cleanup
   socket.on('disconnect', () => {
     console.log(`[Server] Client disconnected: ${socket.id}`);
-    const meta = socketMetadata.get(socket.id);
-    if (meta) {
-      const { roomId, username } = meta;
-      socketMetadata.delete(socket.id);
-      socket.leave(roomId);
-
-      const room = rooms.get(roomId);
-      if (room) {
-        // If the host disconnected, designate a new host if possible
-        if (room.hostId === socket.id) {
-          const clientsInRoom = io.sockets.adapter.rooms.get(roomId);
-          if (clientsInRoom && clientsInRoom.size > 0) {
-            // Pick first remaining client in the room
-            const newHostId = Array.from(clientsInRoom)[0];
-            room.hostId = newHostId;
-            const newHostMeta = socketMetadata.get(newHostId);
-            const newHostUsername = newHostMeta ? newHostMeta.username : 'Guest';
-
-            console.log(`[Server] Host left. Designated new host: ${newHostId} (${newHostUsername})`);
-            io.in(roomId).emit('host-changed', {
-              hostId: newHostId,
-              hostUsername: newHostUsername
-            });
-          } else {
-            // Delete room if empty
-            rooms.delete(roomId);
-            console.log(`[Server] Room empty. Room deleted: ${roomId}`);
-          }
-        } else {
-          // Notify room members that a guest left
-          socket.to(roomId).emit('user-left', {
-            socketId: socket.id,
-            username
-          });
-        }
-
-        // Broadcast updated room members
-        sendRoomMembers(roomId);
-      }
-    }
+    handleUserLeaving(socket);
   });
 });
 
-// Helper to gather and send all current active members in a room
+function handleUserLeaving(socket: Socket) {
+  const meta = socketMetadata.get(socket.id);
+  if (!meta) return;
+
+  const { roomId, username } = meta;
+  socketMetadata.delete(socket.id);
+  socket.leave(roomId);
+
+  const room = rooms.get(roomId);
+  if (room) {
+    // If host leaves, designate new host
+    if (room.hostId === socket.id) {
+      const clientsInRoom = io.sockets.adapter.rooms.get(roomId);
+      if (clientsInRoom && clientsInRoom.size > 0) {
+        const newHostId = Array.from(clientsInRoom)[0];
+        room.hostId = newHostId;
+        const newHostMeta = socketMetadata.get(newHostId);
+        const newHostUsername = newHostMeta ? newHostMeta.username : 'Guest';
+
+        console.log(`[Server] Host left. New host designated: ${newHostId} (${newHostUsername})`);
+        io.in(roomId).emit('host-changed', {
+          hostId: newHostId,
+          hostUsername: newHostUsername
+        });
+      } else {
+        rooms.delete(roomId);
+        console.log(`[Server] Room empty. Room deleted: ${roomId}`);
+      }
+    } else {
+      socket.to(roomId).emit('user-left', {
+        socketId: socket.id,
+        username
+      });
+    }
+
+    sendRoomMembers(roomId);
+  }
+}
+
+// Helper to gather and send room members
 function sendRoomMembers(roomId: string) {
   const room = rooms.get(roomId);
   if (!room) return;
